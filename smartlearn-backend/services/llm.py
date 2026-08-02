@@ -40,3 +40,4 @@ def answer_from_pages(pages: list[dict], message: str) -> str:
         ],
     )
     return response.choices[0].message.content or ""
+
