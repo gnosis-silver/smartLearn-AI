@@ -5,8 +5,8 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .services.llm import answer_from_pages
-from .services.pdf import extract_pages
+from services.llm import answer_from_pages
+from services.pdf import extract_pages
 
 app = FastAPI(title="SmartLearn Lite API")
 documents: dict[str, list[dict]] = {}
