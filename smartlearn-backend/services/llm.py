@@ -8,6 +8,8 @@ load_dotenv()
 SYSTEM_PROMPT = (
     "You answer messages only from the supplied PDF text. "
     "Cite factual claims with [Page X]. "
+    "When writing mathematical formulas or symbols, always wrap them in LaTeX delimiters: "
+    "use \\( ... \\) for inline math and \\[ ... \\] for display/block math. "
     "If the answer is not in the PDF, say that the document does not provide enough information. "
     "Never invent a page number."
 )
