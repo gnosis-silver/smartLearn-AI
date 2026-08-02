@@ -1,0 +1,129 @@
+/* index.css — global styles applied across the whole app */
+:root {
+  font-family: Inter, system-ui, sans-serif;
+  color: #172033;
+  background: #f4f7fb;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  width: min(760px, calc(100% - 32px));
+  margin: 48px auto;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 1.75rem;
+}
+
+h2 {
+  margin: 0 0 12px;
+  font-size: 1.15rem;
+}
+
+/* ── Card ── */
+.card {
+  background: white;
+  border: 1px solid #dbe3ee;
+  border-radius: 16px;
+  padding: 24px;
+}
+
+/* ── Form elements ── */
+label {
+  display: block;
+  margin-bottom: 8px;
+  font-weight: 500;
+  font-size: 0.9rem;
+}
+
+input[type="file"] {
+  margin-bottom: 12px;
+}
+
+textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #dbe3ee;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 0.95rem;
+  resize: vertical;
+  box-sizing: border-box;
+}
+
+textarea:focus {
+  outline: none;
+  border-color: #4f7dff;
+  box-shadow: 0 0 0 3px rgba(79, 125, 255, 0.15);
+}
+
+/* ── Buttons ── */
+button {
+  padding: 10px 20px;
+  border: none;
+  border-radius: 8px;
+  background: #172033;
+  color: white;
+  font-family: inherit;
+  font-size: 0.9rem;
+  font-weight: 500;
+  cursor: pointer;
+  margin-top: 4px;
+}
+
+button:hover:not(:disabled) {
+  background: #2a3853;
+}
+
+button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+/* ── Error ── */
+.error {
+  color: #a61b1b;
+  font-weight: 500;
+}
+
+/* ── Upload info ── */
+.upload-info {
+  margin-top: 12px;
+  font-size: 0.9rem;
+  color: #516883;
+}
+
+/* ── Page chips ── */
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.chip {
+  display: inline-block;
+  padding: 4px 12px;
+  background: #eef2f9;
+  border-radius: 20px;
+  font-size: 0.82rem;
+  color: #172033;
+}
+
+/* ── Responsive ── */
+@media (max-width: 500px) {
+  main {
+    margin: 24px auto;
+  }
+
+  .card {
+    padding: 16px;
+  }
+}
