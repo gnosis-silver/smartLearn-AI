@@ -1042,6 +1042,154 @@ def evaluate_questions(
     return pd.DataFrame(rows)
 
 
+# ── Optional Chroma branch ───────────────────────────────────────────────────
+
+def _require_chromadb():
+    """Import ``chromadb`` or raise a clear ``ImportError``."""
+    try:
+        import chromadb
+        return chromadb
+    except ImportError:
+        raise ImportError(
+            "chromadb is required for the Chroma path. "
+            "Install it with: pip install chromadb"
+        )
+
+
+def build_chroma_collection(
+    document_id: str,
+    chunks: list[dict],
+    embeddings: "np.ndarray",
+    persist_dir: Union[str, Path],
+) -> dict:
+    """Create (or reopen) a persistent Chroma collection from *chunks* and *embeddings*.
+
+    Returns collection metadata: ``collection_name`` and ``item_count``.
+    """
+    import numpy as np
+
+    chromadb = _require_chromadb()
+    persist_dir = Path(persist_dir)
+    persist_dir.mkdir(parents=True, exist_ok=True)
+
+    client = chromadb.PersistentClient(path=str(persist_dir))
+    collection = client.get_or_create_collection(name=document_id)
+
+    # Only add if the collection is empty (idempotent)
+    if collection.count() == 0:
+        ids = [c["chunk_id"] for c in chunks]
+        documents = [c["text"] for c in chunks]
+        metadatas = [{"page": c["page"], "chunk_id": c["chunk_id"]} for c in chunks]
+        emb_list = np.asarray(embeddings, dtype="float32").tolist()
+
+        collection.add(
+            ids=ids,
+            documents=documents,
+            metadatas=metadatas,
+            embeddings=emb_list,
+        )
+
+    return {
+        "collection_name": document_id,
+        "item_count": collection.count(),
+    }
+
+
+def query_chroma_collection(
+    document_id: str,
+    query_embedding: "np.ndarray",
+    persist_dir: Union[str, Path],
+    top_k: int = 3,
+) -> list[dict]:
+    """Query a persistent Chroma collection for top-k matches.
+
+    Returns hits with ``chunk_id``, ``page``, ``text``, and ``score``.
+    """
+    import numpy as np
+
+    chromadb = _require_chromadb()
+    persist_dir = Path(persist_dir)
+
+    client = chromadb.PersistentClient(path=str(persist_dir))
+    collection = client.get_collection(name=document_id)
+
+    q_vec = np.asarray(query_embedding, dtype="float32").tolist()
+    result = collection.query(
+        query_embeddings=q_vec,
+        n_results=min(top_k, collection.count()),
+    )
+
+    hits: list[dict] = []
+    if result["ids"] and result["ids"][0]:
+        for i, chunk_id in enumerate(result["ids"][0]):
+            metadata = result["metadatas"][0][i] if result["metadatas"] else {}
+            doc_text = result["documents"][0][i] if result["documents"] else ""
+            distance = result["distances"][0][i] if result["distances"] else 0
+            hits.append({
+                "chunk_id": chunk_id,
+                "page": metadata.get("page", 1),
+                "text": doc_text,
+                "score": round(1.0 - float(distance), 4),  # distance → similarity
+            })
+
+    return hits
+
+
+def search_document_with_chroma(
+    question: str,
+    document: dict,
+    persist_dir: Union[str, Path],
+    top_k: int = 3,
+    batch_size: int = 1,
+) -> list[dict]:
+    """Search one document via its Chroma collection.
+
+    Embeds *question*, queries the persisted collection, and returns
+    hits in the same shape as :func:`search_document`.
+    """
+    device = get_device()
+    model_name = document["model_name"]
+    model_source = document.get("model_source", model_name)
+
+    q_vec = embed_texts(
+        [question], model_name,
+        model_source=model_source, batch_size=max(batch_size, 1), device=device,
+    )
+
+    return query_chroma_collection(
+        document["document_id"], q_vec, persist_dir, top_k=top_k,
+    )
+
+
+def answer_document_with_chroma(
+    document: dict,
+    question: str,
+    persist_dir: Union[str, Path],
+    top_k: int = 3,
+    answer_model: str = "tencent/hy3:free",
+) -> dict:
+    """Answer a question using the Chroma retrieval path.
+
+    Returns the same ``{answer, citations, sources}`` shape as
+    :func:`answer_document`.
+    """
+    hits = search_document_with_chroma(
+        question, document, persist_dir, top_k=top_k,
+    )
+
+    api_key = __import__("os").environ.get("OPENROUTER_API_KEY", "")
+    if api_key:
+        answer = _llm_answer(question, hits, answer_model, api_key)
+    else:
+        answer = best_sentence_answer(question, hits)
+
+    return {
+        "answer": answer,
+        "citations": extract_citations(answer, hits),
+        "sources": build_sources(hits),
+    }
+
+
 # ── Preview helpers ─────────────────────────────────────────────────────────
 
 def preview_records(
