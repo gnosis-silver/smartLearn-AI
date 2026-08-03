@@ -196,6 +196,63 @@ def chunk_by_characters(
     return chunks
 
 
+def chunk_with_langchain_recursive(
+    records: list[dict],
+    chunk_size: int = 700,
+    chunk_overlap: int = 120,
+    separators: Optional[list[str]] = None,
+) -> list[dict]:
+    """Chunk pages with LangChain's ``RecursiveCharacterTextSplitter``.
+
+    Tries larger separators first (``\\n\\n`` → ``\\n`` → `` `` → ``""``),
+    so paragraph-like boundaries are preferred.  When PDF text is messy,
+    this usually produces cleaner chunk starts than a plain paragraph split.
+
+    Every returned chunk keeps the same schema as the rest of ``rag.py``:
+    ``chunk_id``, ``page``, ``text``, ``chunk_mode``.
+    """
+    try:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+    except ImportError:
+        raise ImportError(
+            "langchain-text-splitters is required for langchain_recursive mode. "
+            "Install it with: pip install langchain-text-splitters"
+        )
+
+    if separators is None:
+        separators = ["\n\n", "\n", " ", ""]
+
+    splitter = RecursiveCharacterTextSplitter(
+        separators=separators,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        length_function=len,
+        is_separator_regex=False,
+    )
+
+    chunks: list[dict] = []
+    chunk_index = 0
+
+    for rec in records:
+        page_text = rec["text"]
+        if not page_text.strip():
+            continue
+        page_chunks = splitter.split_text(page_text)
+        for text in page_chunks:
+            text = text.strip()
+            if not text:
+                continue
+            chunks.append({
+                "chunk_id": f"chunk-{chunk_index:04d}",
+                "page": rec["page"],
+                "text": text,
+                "chunk_mode": "langchain_recursive",
+            })
+            chunk_index += 1
+
+    return chunks
+
+
 def build_chunks(
     records: list[dict],
     chunk_mode: str,
@@ -209,10 +266,15 @@ def build_chunks(
         return chunk_by_characters(records, chunk_size, overlap=0)
     elif chunk_mode == "character_overlap":
         return chunk_by_characters(records, chunk_size, overlap=overlap)
+    elif chunk_mode == "langchain_recursive":
+        return chunk_with_langchain_recursive(
+            records, chunk_size=chunk_size, chunk_overlap=overlap,
+        )
     else:
         raise ValueError(
             f"Unknown chunk_mode {chunk_mode!r}. "
-            f"Expected: paragraph, character, or character_overlap."
+            f"Expected: paragraph, character, character_overlap, "
+            f"or langchain_recursive."
         )
 
 
@@ -267,7 +329,14 @@ def load_model(
     if cache_key in _load_model_cache:
         return _load_model_cache[cache_key]
 
+    import os
     from sentence_transformers import SentenceTransformer
+
+    # If loading from a local folder, stay offline to avoid the HF Hub
+    # "unauthenticated requests" warning every time the model is loaded.
+    model_path = Path(str(model_source))
+    if model_path.exists():
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
     model = SentenceTransformer(
         str(model_source),
@@ -420,6 +489,557 @@ def ensure_artifacts(
     save_json(manifest, paths["manifest"])
 
     return {"chunks": chunks, "embeddings": embeddings, "manifest": manifest}
+
+
+# ── FAISS index ──────────────────────────────────────────────────────────────
+
+def build_faiss_index(embeddings: "np.ndarray"):
+    """Build a FAISS inner-product index from normalised embedding vectors.
+
+    When vectors are L2-normalised, inner product equals cosine similarity,
+    so ``IndexFlatIP`` gives the same ranking as cosine search without the
+    extra normalisation step at query time.
+    """
+    import faiss
+    import numpy as np
+
+    embeddings = np.asarray(embeddings, dtype="float32")
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)
+    index.add(embeddings)
+    return index
+
+
+def save_faiss_index(index, index_path: Union[str, Path]) -> None:
+    """Write a FAISS index to a binary ``.faiss`` file on disk."""
+    import faiss
+
+    index_path = Path(index_path)
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(index, str(index_path))
+
+
+def load_faiss_index(index_path: Union[str, Path]):
+    """Read a saved FAISS index back into memory."""
+    import faiss
+
+    return faiss.read_index(str(index_path))
+
+
+def ensure_index(
+    document_id: str,
+    pdf_name: str,
+    pages: Optional[list[dict]] = None,
+    pdf_path: Union[str, Path, None] = None,
+    chunk_mode: str = "character_overlap",
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    chunk_size: int = 700,
+    overlap: int = 120,
+    batch_size: int = 32,
+    artifact_root: Union[str, Path, None] = None,
+) -> dict:
+    """Build (or reuse) chunks, embeddings, and a FAISS index for one PDF.
+
+    Returns a bundle with ``chunks``, ``embeddings``, ``manifest``, and
+    ``faiss_index`` so callers can search immediately.
+    """
+    import numpy as np
+
+    # Resolve pages: use cached, extract from pdf_path, or use caller-supplied
+    if pages is None and pdf_path is not None:
+        pages = extract_pages_for_rag(pdf_path)
+
+    if pages is None:
+        raise ValueError("Either pages or pdf_path must be provided.")
+
+    paths = artifact_paths_for(
+        document_id, chunk_mode, model_name, chunk_size, overlap, artifact_root,
+    )
+
+    # ── chunks + embeddings (reuse Lab A) ──
+    if paths["chunks"].exists():
+        chunks = load_json(paths["chunks"])
+    else:
+        chunks = build_chunks(pages, chunk_mode=chunk_mode, chunk_size=chunk_size, overlap=overlap)
+        save_json(chunks, paths["chunks"])
+
+    if paths["embeddings"].exists():
+        embeddings = np.load(paths["embeddings"], allow_pickle=False)
+    else:
+        device = get_device()
+        model_source = resolve_model_source(model_name, artifact_root)
+        texts = [c["text"] for c in chunks]
+        embeddings = embed_texts(
+            texts, model_name, model_source=model_source,
+            batch_size=batch_size, device=device,
+        )
+        np.save(paths["embeddings"], embeddings)
+
+    # ── FAISS index ──
+    if paths["index"].exists():
+        index = load_faiss_index(paths["index"])
+    else:
+        index = build_faiss_index(embeddings)
+        save_faiss_index(index, paths["index"])
+
+    # ── model source (for later question embedding) ──
+    model_source = resolve_model_source(model_name, artifact_root)
+
+    # ── manifest ──
+    manifest = {
+        "document_id": document_id,
+        "pdf_name": pdf_name,
+        "num_pages": len(pages),
+        "chunk_mode": chunk_mode,
+        "chunk_size": chunk_size,
+        "overlap": overlap,
+        "model_name": model_name,
+        "model_source": str(model_source),
+        "num_chunks": len(chunks),
+        "embedding_dim": int(embeddings.shape[1]),
+        "device": get_device(),
+        "chunk_path": str(paths["chunks"]),
+        "embedding_path": str(paths["embeddings"]),
+        "raw_pages_path": str(paths["raw_pages"]),
+        "index_path": str(paths["index"]),
+    }
+    save_json(manifest, paths["manifest"])
+
+    return {
+        "chunks": chunks,
+        "embeddings": embeddings,
+        "faiss_index": index,
+        "manifest": manifest,
+        "model_source": model_source,
+    }
+
+
+# ── Project-facing document wrapper ──────────────────────────────────────────
+
+def prepare_rag_document(
+    document_id: str,
+    filename: str,
+    pages: list[dict],
+    chunk_mode: str = "character_overlap",
+    chunk_size: int = 700,
+    overlap: int = 120,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 32,
+    artifact_root: Union[str, Path, None] = None,
+) -> dict:
+    """Package one PDF into a server-side document record.
+
+    The returned dict is ready to be stored in ``documents[document_id]``
+    and reused across multiple questions without rebuilding the index.
+    """
+    bundle = ensure_index(
+        document_id=document_id,
+        pdf_name=filename,
+        pages=pages,
+        chunk_mode=chunk_mode,
+        model_name=model_name,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        batch_size=batch_size,
+        artifact_root=artifact_root,
+    )
+
+    device = get_device()
+    model_source = resolve_model_source(model_name, artifact_root)
+
+    return {
+        "document_id": document_id,
+        "filename": filename,
+        "pages": pages,
+        "chunks": bundle["chunks"],
+        "model_name": model_name,
+        "model_source": str(model_source),
+        "chunk_size": len(bundle["chunks"]),
+        "embedding_dim": bundle["manifest"]["embedding_dim"],
+        "artifacts": {
+            "index": bundle["manifest"]["index_path"],
+            "chunks": bundle["manifest"]["chunk_path"],
+            "embeddings": bundle["manifest"]["embedding_path"],
+            "raw_pages": bundle["manifest"]["raw_pages_path"],
+        },
+        "history": [],
+    }
+
+
+# ── Retrieval helpers ────────────────────────────────────────────────────────
+
+def keyword_set(text: str) -> set[str]:
+    """Return lightweight lexical tokens from *text* for simple reranking.
+
+    Lowercases, then extracts word-character runs so that e.g. "BM25"
+    and "Llama-3-70B" stay as single tokens.
+    """
+    return set(re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", text.lower()))
+
+
+def split_sentences(text: str) -> list[str]:
+    """Split *text* into candidate answer sentences.
+
+    Splits on ``. `` ``! `` ``? `` and newline-then-sentence-start,
+    keeping only fragments longer than 10 characters.
+    """
+    raw = re.split(r"(?<=[.!?])\s+|\n(?=[A-Z])", text)
+    return [s.strip() for s in raw if len(s.strip()) > 10]
+
+
+def search_bundle(
+    question: str,
+    bundle: dict,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    batch_size: int = 1,
+    history: Optional[list[dict]] = None,
+) -> list[dict]:
+    """Search an in-memory FAISS index bundle for the top-k chunks.
+
+    Retrieves *candidate_pool* nearest neighbours, applies a light
+    lexical boost, then returns the top *top_k* hits with page,
+    chunk_id, text, and score fields.
+    """
+    import numpy as np
+
+    chunks = bundle["chunks"]
+    faiss_index = bundle["faiss_index"]
+    manifest = bundle["manifest"]
+
+    model_name = manifest.get("model_name", "sentence-transformers/all-MiniLM-L6-v2")
+    model_source = bundle.get("model_source") or manifest.get("model_source") or model_name
+    device = get_device()
+
+    # ── embed question ──
+    q_vec = embed_texts(
+        [question],
+        model_name,
+        model_source=model_source,
+        batch_size=max(batch_size, 1),
+        device=device,
+    )
+
+    # ── FAISS search ──
+    k = min(candidate_pool, faiss_index.ntotal)
+    scores, indices = faiss_index.search(q_vec, k)
+
+    # ── map to hits with light lexical rerank ──
+    q_keywords = keyword_set(question)
+    raw_hits: list[dict] = []
+
+    for i in range(k):
+        idx = indices[0][i]
+        if idx == -1:          # FAISS padding for short indexes
+            continue
+        score = float(scores[0][i])
+        chunk = chunks[idx]
+
+        # Light lexical boost: each overlapping keyword adds a small bonus
+        chunk_keywords = keyword_set(chunk["text"])
+        overlap = len(q_keywords & chunk_keywords)
+        combined = score * (1.0 + 0.05 * overlap)
+
+        raw_hits.append({
+            "page": chunk["page"],
+            "chunk_id": chunk["chunk_id"],
+            "text": chunk["text"],
+            "score": round(combined, 4),
+            "vector_score": round(score, 4),
+        })
+
+    # Re-rank by combined score
+    raw_hits.sort(key=lambda h: h["score"], reverse=True)
+    return raw_hits[:top_k]
+
+
+def search_document(
+    question: str,
+    document: dict,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    history: Optional[list[dict]] = None,
+) -> list[dict]:
+    """Load the saved FAISS index for *document* and return top-k hits.
+
+    This is the project-facing entry point: it reads the ``.faiss`` file
+    from disk, rebuilds an in-memory bundle, and delegates to
+    :func:`search_bundle`.
+    """
+    index_path = document["artifacts"]["index"]
+    faiss_index = load_faiss_index(index_path)
+
+    chunks = document.get("chunks")
+    if chunks is None:
+        chunks = load_json(document["artifacts"]["chunks"])
+
+    bundle = {
+        "chunks": chunks,
+        "faiss_index": faiss_index,
+        "manifest": {
+            "model_name": document["model_name"],
+            "model_source": document.get("model_source", document["model_name"]),
+        },
+        "model_source": document.get("model_source", document["model_name"]),
+    }
+
+    return search_bundle(
+        question, bundle,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        history=history,
+    )
+
+
+def best_sentence_answer(question: str, hits: list[dict]) -> str:
+    """Return one short answer sentence from *hits* with a page tag.
+
+    Splits every hit into sentences, scores each by keyword overlap with
+    the question, and keeps the best one.  Falls back to the first 200
+    chars of the top hit when no sentence is long enough.
+    """
+    if not hits:
+        return "No relevant passage found."
+
+    # Collect candidate sentences
+    candidates: list[tuple[str, int]] = []
+    for hit in hits:
+        for sent in split_sentences(hit["text"]):
+            candidates.append((sent, hit["page"]))
+
+    if not candidates:
+        return f"{hits[0]['text'][:200]} [page {hits[0]['page']}]"
+
+    # Best by keyword overlap
+    q_keywords = keyword_set(question)
+    best_sent, best_page, best_score = "", 1, -1
+
+    for sent, page in candidates:
+        sent_keywords = keyword_set(sent)
+        overlap = len(q_keywords & sent_keywords)
+        if overlap > best_score:
+            best_score = overlap
+            best_sent = sent
+            best_page = page
+
+    if not best_sent:
+        best_sent, best_page = candidates[0]
+
+    return f"{best_sent} [page {best_page}]"
+
+
+# ── Project-facing answer wrapper ────────────────────────────────────────────
+
+def extract_citations(
+    answer: str,
+    hits: Optional[list[dict]] = None,
+) -> list[int]:
+    """Return numeric PDF page citations from an answer string.
+
+    Looks for ``[page N]`` tags in *answer* first, then falls back to
+    unique page numbers in *hits*.
+    """
+    pages: set[int] = set()
+
+    # Parse [page N] tags
+    for match in re.finditer(r"\[page\s*(\d+)\]", answer):
+        pages.add(int(match.group(1)))
+
+    # Fallback: pages from retrieval hits
+    if not pages and hits:
+        pages.update(hit["page"] for hit in hits)
+
+    return sorted(pages)
+
+
+def build_sources(hits: list[dict]) -> list[dict]:
+    """Convert retrieval hits into frontend-friendly source objects.
+
+    Each source carries *page*, *chunk_id*, *score*, and a *preview*
+    (first 200 chars of the chunk text).
+    """
+    return [
+        {
+            "page": h["page"],
+            "chunk_id": h["chunk_id"],
+            "score": h["score"],
+            "preview": h["text"][:200],
+        }
+        for h in hits
+    ]
+
+
+def answer_document(
+    document: dict,
+    question: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "tencent/hy3:free",
+) -> dict:
+    """Answer one question against a prepared document record.
+
+    Always returns ``answer``, ``citations``, and ``sources``:
+
+    - When ``OPENROUTER_API_KEY`` is set, the LLM answers from
+      retrieved chunks.
+    - When the key is missing, a local sentence is extracted from
+      the top retrieval hits.
+    """
+    # ── retrieval ──
+    hits = search_document(
+        question, document,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+    )
+
+    # ── answer ──
+    api_key = __import__("os").environ.get("OPENROUTER_API_KEY", "")
+    if api_key:
+        # LLM path: pass retrieved chunks as context
+        answer = _llm_answer(question, hits, answer_model, api_key)
+    else:
+        answer = best_sentence_answer(question, hits)
+
+    # ── citations + sources ──
+    citations = extract_citations(answer, hits)
+    sources = build_sources(hits)
+
+    return {
+        "answer": answer,
+        "citations": citations,
+        "sources": sources,
+    }
+
+
+def _llm_answer(
+    question: str,
+    hits: list[dict],
+    model: str,
+    api_key: str,
+) -> str:
+    """Ask an LLM to answer *question* using the retrieved *hits* as context."""
+    context = "\n\n".join(
+        f"[{h['chunk_id']} page {h['page']}] {h['text']}" for h in hits
+    )
+    prompt = (
+        "You are a helpful teaching assistant. Answer the question "
+        "using ONLY the provided context below. Keep the answer short. "
+        "Include [page N] at the end of your answer.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {question}\n"
+        "Answer:"
+    )
+    try:
+        import openai
+        client = openai.OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+        )
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=256,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception:
+        # Fall back to local extraction on any LLM error
+        return best_sentence_answer(question, hits)
+
+
+def append_history(
+    document: dict,
+    question: str,
+    result: dict,
+) -> list[dict]:
+    """Append a Q&A turn to the document's in-memory history and return it."""
+    document["history"].append({
+        "question": question,
+        "answer": result["answer"],
+        "citations": result["citations"],
+    })
+    return document["history"]
+
+
+# ── Evaluation helpers ────────────────────────────────────────────────────────
+
+def normalize_for_match(text: str) -> str:
+    """Normalize *text* for simple string-based scoring.
+
+    Lowercases, collapses whitespace, and strips punctuation so that
+    ``"BM25"`` and ``"  bm25  "`` match each other.
+    """
+    text = text.lower()
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip().rstrip(".")
+    return text
+
+
+def contains_any_answer(text: str, answers: list[str]) -> bool:
+    """Return ``True`` when *text* contains at least one acceptable answer.
+
+    Both *text* and every answer are normalised before comparison.
+    """
+    norm_text = normalize_for_match(text)
+    return any(normalize_for_match(a) in norm_text for a in answers)
+
+
+def evaluate_questions(
+    eval_set: list[dict],
+    documents_by_name: dict[str, dict],
+    top_k: int = 3,
+    candidate_pool: int = 60,
+) -> "pd.DataFrame":
+    """Run the *eval_set* against prepared documents and return a score table.
+
+    Each row records the question, retrieved pages, local answer,
+    ``retrieval_hit`` (gold answer appears in any retrieved chunk), and
+    ``answer_hit`` (gold answer appears in the extracted answer sentence).
+    """
+    import pandas as pd
+
+    rows: list[dict] = []
+
+    for item in eval_set:
+        pdf_name = item["pdf_name"]
+        question = item["question"]
+        gold_answers = item["answers"]
+
+        doc = documents_by_name.get(pdf_name)
+        if doc is None:
+            rows.append({
+                "pdf_name": pdf_name,
+                "question": question,
+                "pages": [],
+                "local_answer": "DOCUMENT NOT FOUND",
+                "retrieval_hit": False,
+                "answer_hit": False,
+            })
+            continue
+
+        # retrieval
+        hits = search_document(
+            question, doc,
+            top_k=top_k,
+            candidate_pool=candidate_pool,
+        )
+        local_answer = best_sentence_answer(question, hits)
+
+        # scoring
+        all_chunk_text = " ".join(h["text"] for h in hits)
+        retrieval_hit = contains_any_answer(all_chunk_text, gold_answers)
+        answer_hit = contains_any_answer(local_answer, gold_answers)
+
+        rows.append({
+            "pdf_name": pdf_name,
+            "question": question,
+            "pages": sorted({h["page"] for h in hits}),
+            "local_answer": local_answer,
+            "retrieval_hit": retrieval_hit,
+            "answer_hit": answer_hit,
+        })
+
+    return pd.DataFrame(rows)
 
 
 # ── Preview helpers ─────────────────────────────────────────────────────────
