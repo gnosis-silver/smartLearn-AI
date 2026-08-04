@@ -1,3 +1,4 @@
+import asyncio
 import os
 from pathlib import Path
 
@@ -79,7 +80,8 @@ async def upload(chat_id: str = Query(...), file: UploadFile = File(...)):
         raise HTTPException(400, "File is empty")
 
     try:
-        record = prepare_rag_chat_record(
+        record = await asyncio.to_thread(
+            prepare_rag_chat_record,
             chat_id=chat_id,
             filename=file.filename,
             pdf_bytes=content,
@@ -135,19 +137,22 @@ def get_document_file(chat_id: str):
 
 
 @app.post("/chat")
-def chat(body: ChatRequest):
+async def chat(body: ChatRequest):
     document = documents.get(body.chat_id)
     if document is None:
         raise HTTPException(404, "Chat ID not found — upload a PDF first")
 
     try:
         if _history_session_factory:
-            result = answer_chat_turn_with_history_store(
+            result = await asyncio.to_thread(
+                answer_chat_turn_with_history_store,
                 document, body.chat_id, body.message,
                 session_factory=_history_session_factory,
             )
         else:
-            result = answer_chat_turn(document, body.message)
+            result = await asyncio.to_thread(
+                answer_chat_turn, document, body.message,
+            )
     except Exception:
         raise HTTPException(502, "Upstream AI call failed")
 
