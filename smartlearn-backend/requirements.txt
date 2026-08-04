@@ -11,4 +11,4 @@ pandas
 langchain-text-splitters
 chromadb
 sqlalchemy
-psycopg[binary]
+psycopg2-binary
