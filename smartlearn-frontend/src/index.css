@@ -10,7 +10,7 @@ body {
 }
 
 main {
-  width: min(760px, calc(100% - 32px));
+  width: min(1300px, calc(100% - 32px));
   margin: 48px auto;
   display: flex;
   flex-direction: column;
@@ -213,6 +213,182 @@ button:disabled {
   border-radius: 20px;
   font-size: 0.82rem;
   color: #172033;
+}
+
+/* ── Side-by-side workspace ── */
+.workspace {
+  display: flex;
+  gap: 24px;
+  align-items: stretch;
+}
+
+.left-col {
+  flex: 2;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.right-col {
+  flex: 3;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── PDF preview ── */
+.preview-panel {
+  display: flex;
+  flex-direction: column;
+  padding: 16px;
+}
+
+.preview-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #8899b4;
+  font-size: 0.95rem;
+}
+
+.preview-header {
+  margin-bottom: 10px;
+}
+
+.preview-label {
+  font-size: 0.82rem;
+  color: #516883;
+  font-weight: 500;
+}
+
+.preview-frame {
+  flex: 1;
+  width: 100%;
+  border: 1px solid #dbe3ee;
+  border-radius: 8px;
+  min-height: 700px;
+}
+
+/* ── Chat header ── */
+.chat-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.chat-header h2 {
+  margin: 0;
+}
+
+.chat-expand-btn {
+  background: none;
+  border: 1px solid #dbe3ee;
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 1rem;
+  cursor: pointer;
+  color: #516883;
+  line-height: 1;
+}
+
+.chat-expand-btn:hover {
+  background: #f0f3fa;
+}
+
+/* ── Chat overlay ── */
+.chat-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.chat-overlay-panel {
+  background: white;
+  border-radius: 16px;
+  padding: 24px;
+  width: min(800px, calc(100% - 48px));
+  height: min(700px, calc(100% - 48px));
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── Chat panel ── */
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(600px + 56px);  /* match preview iframe + header */
+}
+
+.chat-messages {
+  flex: 1;
+  overflow-y: auto;
+  margin-bottom: 12px;
+  padding-right: 4px;
+}
+
+.chat-placeholder {
+  color: #8899b4;
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+.chat-form {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.chat-form textarea {
+  flex: 1;
+  margin-bottom: 0;
+}
+
+.chat-form button {
+  margin-top: 0;
+  white-space: nowrap;
+}
+
+/* ── Message bubbles ── */
+.msg {
+  margin-bottom: 14px;
+  padding: 10px 14px;
+  border-radius: 10px;
+}
+
+.msg-user {
+  background: #e8ecf4;
+}
+
+.msg-assistant {
+  background: #eef6f0;
+}
+
+.msg-role {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #6b7d99;
+  margin-bottom: 4px;
+}
+
+.msg-content {
+  font-size: 0.93rem;
+  line-height: 1.6;
+}
+
+/* ── Clickable citation chips ── */
+.chip-btn {
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+.chip-btn:hover {
+  background: #d4dff7;
 }
 
 /* ── Responsive ── */

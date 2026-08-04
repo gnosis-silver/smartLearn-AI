@@ -1,15 +1,15 @@
 import os
-import re
+from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from services.llm import answer_from_pages
-from services.pdf import extract_pages
+from services.rag import answer_chat_turn, build_upload_response, prepare_rag_chat_record
 
 app = FastAPI(title="SmartLearn Lite API")
-documents: dict[str, list[dict]] = {}
+documents: dict[str, dict] = {}
 
 allowed_origins = [
     origin.strip()
@@ -51,39 +51,51 @@ async def upload(chat_id: str = Query(...), file: UploadFile = File(...)):
     content = await file.read()
     if not content:
         raise HTTPException(400, "File is empty")
+
+    # Build the Day 3 RAG-ready record (pages, chunks, embeddings, FAISS index, empty history)
     try:
-        pages = extract_pages(content)
+        record = prepare_rag_chat_record(
+            chat_id=chat_id,
+            filename=file.filename,
+            pdf_bytes=content,
+            upload_root=Path("smartlearn-backend") / "uploads",
+        )
     except ValueError as exc:
         raise HTTPException(400, str(exc))
-    total_chars = sum(len(p["text"]) for p in pages)
+
+    total_chars = sum(len(p["text"]) for p in record["pages"])
     if total_chars == 0:
         raise HTTPException(422, "No readable text found — OCR is not supported")
-    documents[chat_id] = pages
-    return {
-        "status": "ok",
-        "filename": file.filename,
-        "pages": len(pages),
-        "characters": total_chars,
-    }
+
+    documents[chat_id] = record
+    return build_upload_response(record)
+
+
+@app.get("/documents/{chat_id}/file")
+def get_document_file(chat_id: str):
+    """Serve the uploaded PDF for a chat session so the frontend can preview it."""
+    record = documents.get(chat_id)
+    if record is None:
+        raise HTTPException(404, "Chat ID not found")
+    file_path = record.get("file_path") or record.get("saved_pdf_path", "")
+    if not file_path or not Path(file_path).exists():
+        raise HTTPException(404, "PDF file not found")
+    return FileResponse(file_path, media_type="application/pdf")
 
 
 @app.post("/chat")
 def chat(body: ChatRequest):
-    pages = documents.get(body.chat_id)
-    if pages is None:
+    document = documents.get(body.chat_id)
+    if document is None:
         raise HTTPException(404, "Chat ID not found — upload a PDF first")
 
     try:
-        answer = answer_from_pages(pages, body.message)
-    except RuntimeError:
-        raise HTTPException(502, "LLM service unavailable — check API key")
+        result = answer_chat_turn(document, body.message)
     except Exception:
         raise HTTPException(502, "Upstream AI call failed")
 
-    citations = sorted({
-        int(m.group(1))
-        for m in re.finditer(r"\[Page\s+(\d+)\]", answer)
-        if int(m.group(1)) <= len(pages)
-    })
-
-    return {"answer": answer, "citations": citations}
+    return {
+        "answer": result["answer"],
+        "citations": result["citations"],
+        "sources": result["sources"],
+    }

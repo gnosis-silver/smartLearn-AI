@@ -6,7 +6,10 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from dotenv import load_dotenv
 from pypdf import PdfReader
+
+load_dotenv()
 
 
 # ── Text cleaning ──────────────────────────────────────────────────────────
@@ -73,6 +76,23 @@ def extract_pages_for_rag(
         if cleaned:
             records.append({"page": page_number, "text": cleaned})
 
+    return records
+
+
+def extract_pages_from_bytes_for_rag(pdf_bytes: bytes) -> list[dict]:
+    """Read PDF pages from uploaded bytes, returning ``[{page, text}]`` records.
+
+    Keeps original PDF page numbers (1-indexed) and skips pages whose
+    extracted text is empty after cleaning.  Designed for the backend
+    upload route where the file arrives as an in-memory byte buffer.
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+    records: list[dict] = []
+    for page_number, page in enumerate(reader.pages, start=1):
+        raw = (page.extract_text() or "").strip()
+        cleaned = clean_text(raw)
+        if cleaned:
+            records.append({"page": page_number, "text": cleaned})
     return records
 
 
@@ -666,6 +686,86 @@ def prepare_rag_document(
     }
 
 
+def prepare_rag_chat_record(
+    chat_id: str,
+    filename: str,
+    pdf_bytes: Optional[bytes] = None,
+    pages: Optional[list[dict]] = None,
+    upload_root: Optional[Union[str, Path]] = None,
+    chunk_mode: str = "character_overlap",
+    chunk_size: int = 700,
+    overlap: int = 120,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+    batch_size: int = 32,
+    artifact_root: Optional[Union[str, Path]] = None,
+) -> dict:
+    """Build a complete upload-time record for one chat session.
+
+    Resolves pages from *pdf_bytes* when not provided, saves the uploaded
+    PDF to *upload_root*, builds chunks/embeddings/FAISS index via
+    :func:`prepare_rag_document`, and returns a dict ready to store in
+    ``documents[chat_id]`` with an empty history list.
+    """
+    # Resolve pages
+    if pages is None and pdf_bytes is not None:
+        pages = extract_pages_from_bytes_for_rag(pdf_bytes)
+    if pages is None:
+        raise ValueError("Either pdf_bytes or pages must be provided.")
+
+    # Save uploaded PDF to disk
+    saved_pdf_path = ""
+    if upload_root is not None:
+        upload_root = Path(upload_root)
+        upload_root.mkdir(parents=True, exist_ok=True)
+        saved_pdf_path = str(upload_root / f"{chat_id}.pdf")
+        if pdf_bytes is not None:
+            Path(saved_pdf_path).write_bytes(pdf_bytes)
+
+    # Delete old cached artifacts so a fresh upload always rebuilds
+    artifact_paths = artifact_paths_for(
+        chat_id, chunk_mode, model_name, chunk_size, overlap, artifact_root,
+    )
+    for key in ("chunks", "embeddings", "manifest", "index"):
+        cached = artifact_paths.get(key)
+        if cached and Path(cached).exists():
+            Path(cached).unlink()
+
+    # Build RAG document (chunks, embeddings, FAISS index)
+    doc = prepare_rag_document(
+        document_id=chat_id,
+        filename=filename,
+        pages=pages,
+        chunk_mode=chunk_mode,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        model_name=model_name,
+        batch_size=batch_size,
+        artifact_root=artifact_root,
+    )
+
+    doc["chat_id"] = chat_id
+    doc["file_path"] = saved_pdf_path
+    doc["saved_pdf_path"] = saved_pdf_path
+
+    return doc
+
+
+def build_upload_response(document: dict) -> dict:
+    """Build the Day 2-compatible upload success JSON from a Day 3 record.
+
+    Keeps the visible frontend contract stable while the server stores a
+    richer RAG-ready record internally.
+    """
+    total_chars = sum(len(p["text"]) for p in document["pages"])
+    return {
+        "status": "ok",
+        "filename": document["filename"],
+        "pages": len(document["pages"]),
+        "characters": total_chars,
+        "chat_id": document.get("chat_id", ""),
+    }
+
+
 # ── Retrieval helpers ────────────────────────────────────────────────────────
 
 def keyword_set(text: str) -> set[str]:
@@ -711,9 +811,19 @@ def search_bundle(
     model_source = bundle.get("model_source") or manifest.get("model_source") or model_name
     device = get_device()
 
-    # ── embed question ──
+    # ── embed question (with history context when available) ──
+    search_question = question
+    if history:
+        recent = history[-3:]
+        # Only use previous questions (not full answers) to avoid noise
+        history_prefix = " | ".join(
+            f"Previous: {turn['question']} (page {turn.get('citations', ['?'])[0]})"
+            for turn in recent
+        )
+        search_question = f"{history_prefix} | Now: {question}"
+
     q_vec = embed_texts(
-        [question],
+        [search_question],
         model_name,
         model_source=model_source,
         batch_size=max(batch_size, 1),
@@ -740,6 +850,14 @@ def search_bundle(
         overlap = len(q_keywords & chunk_keywords)
         combined = score * (1.0 + 0.05 * overlap)
 
+        # Boost chunks from pages cited in conversation history
+        if history:
+            cited_pages = set()
+            for turn in history:
+                cited_pages.update(turn.get("citations", []))
+            if chunk["page"] in cited_pages:
+                combined *= 1.1  # 10% boost for previously cited pages
+
         raw_hits.append({
             "page": chunk["page"],
             "chunk_id": chunk["chunk_id"],
@@ -748,9 +866,17 @@ def search_bundle(
             "vector_score": round(score, 4),
         })
 
-    # Re-rank by combined score
+    # Re-rank by combined score, then pick top-1 chunk per page for diversity
     raw_hits.sort(key=lambda h: h["score"], reverse=True)
-    return raw_hits[:top_k]
+    diverse: list[dict] = []
+    seen_pages: set[int] = set()
+    for h in raw_hits:
+        if h["page"] not in seen_pages:
+            diverse.append(h)
+            seen_pages.add(h["page"])
+        if len(diverse) >= top_k:
+            break
+    return diverse
 
 
 def search_document(
@@ -869,12 +995,48 @@ def build_sources(hits: list[dict]) -> list[dict]:
     ]
 
 
+def build_grounded_user_prompt(
+    question: str,
+    hits: list[dict],
+    history: Optional[list[dict]] = None,
+) -> str:
+    """Build a grounded prompt with retrieved chunks and optional chat history.
+
+    Includes the last 5 conversation turns (when available) so the LLM can
+    use earlier context while still grounding its answer in fresh retrieval.
+    """
+    context = "\n\n".join(
+        f"[{h['chunk_id']} page {h['page']}] {h['text']}" for h in hits
+    )
+
+    prompt_parts = [
+        "You are a helpful teaching assistant. Answer the question "
+        "based on the provided document context. Do not make up information "
+        "that is not in the context. Keep the answer concise. "
+        "Include [page N] at the end of your answer.\n",
+    ]
+
+    if history:
+        recent = history[-5:]  # keep context manageable
+        history_text = "\n".join(
+            f"Q: {turn['question']}\nA: {turn['answer']}"
+            for turn in recent
+        )
+        prompt_parts.append(f"Previous conversation:\n{history_text}\n")
+
+    prompt_parts.append(f"Context:\n{context}\n")
+    prompt_parts.append(f"Question: {question}\n")
+    prompt_parts.append("Answer:")
+
+    return "\n".join(prompt_parts)
+
+
 def answer_document(
     document: dict,
     question: str,
     top_k: int = 3,
     candidate_pool: int = 60,
-    answer_model: str = "tencent/hy3:free",
+    answer_model: str = "deepseek-chat",
 ) -> dict:
     """Answer one question against a prepared document record.
 
@@ -890,13 +1052,14 @@ def answer_document(
         question, document,
         top_k=top_k,
         candidate_pool=candidate_pool,
+        history=document.get("history"),
     )
 
     # ── answer ──
     api_key = __import__("os").environ.get("OPENROUTER_API_KEY", "")
     if api_key:
-        # LLM path: pass retrieved chunks as context
-        answer = _llm_answer(question, hits, answer_model, api_key)
+        # LLM path: pass retrieved chunks and history as context
+        answer = _llm_answer(question, hits, answer_model, api_key, history=document.get("history"))
     else:
         answer = best_sentence_answer(question, hits)
 
@@ -916,23 +1079,18 @@ def _llm_answer(
     hits: list[dict],
     model: str,
     api_key: str,
+    history: Optional[list[dict]] = None,
 ) -> str:
-    """Ask an LLM to answer *question* using the retrieved *hits* as context."""
-    context = "\n\n".join(
-        f"[{h['chunk_id']} page {h['page']}] {h['text']}" for h in hits
-    )
-    prompt = (
-        "You are a helpful teaching assistant. Answer the question "
-        "using ONLY the provided context below. Keep the answer short. "
-        "Include [page N] at the end of your answer.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {question}\n"
-        "Answer:"
-    )
+    """Ask an LLM to answer *question* using the retrieved *hits* as context.
+
+    When *history* is provided, includes recent conversation turns so the
+    LLM can resolve pronouns like "that page" correctly.
+    """
+    prompt = build_grounded_user_prompt(question, hits, history=history)
     try:
         import openai
         client = openai.OpenAI(
-            base_url="https://openrouter.ai/api/v1",
+            base_url="https://api.deepseek.com",
             api_key=api_key,
         )
         resp = client.chat.completions.create(
@@ -959,6 +1117,51 @@ def append_history(
         "citations": result["citations"],
     })
     return document["history"]
+
+
+def answer_document_turn(
+    document: dict,
+    question: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "deepseek-chat",
+) -> dict:
+    """Answer one question and update in-memory history.
+
+    Calls :func:`answer_document` for retrieval + answering, then appends
+    the turn via :func:`append_history`.  Returns the answer result with
+    an extra ``history`` key so callers can inspect the updated list.
+    """
+    result = answer_document(
+        document, question,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        answer_model=answer_model,
+    )
+    append_history(document, question, result)
+    result["history"] = document["history"]
+    return result
+
+
+def answer_chat_turn(
+    document: dict,
+    message: str,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "deepseek-chat",
+) -> dict:
+    """Route-level entry point for one chat turn.
+
+    Retrieves fresh evidence, answers the question, and stores the turn
+    in the document's in-memory history.  Designed to be called directly
+    from the ``POST /chat`` route.
+    """
+    return answer_document_turn(
+        document, message,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        answer_model=answer_model,
+    )
 
 
 # ── Evaluation helpers ────────────────────────────────────────────────────────
@@ -1166,7 +1369,7 @@ def answer_document_with_chroma(
     question: str,
     persist_dir: Union[str, Path],
     top_k: int = 3,
-    answer_model: str = "tencent/hy3:free",
+    answer_model: str = "deepseek-chat",
 ) -> dict:
     """Answer a question using the Chroma retrieval path.
 
