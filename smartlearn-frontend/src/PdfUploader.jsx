@@ -1,13 +1,13 @@
 /* PdfUploader.jsx — handles PDF file selection and upload */
 import { uploadPDF } from './api.js'
 
-export default function PdfUploader({ file, onFileChange, upload, setUpload, status, setStatus, setError, isBusy }) {
+export default function PdfUploader({ file, onFileChange, upload, setUpload, status, setStatus, setError, isBusy, chatId }) {
   async function handleUpload() {
     if (!file) return
     try {
       setError('')
       setStatus('uploading')
-      const result = await uploadPDF(file)
+      const result = await uploadPDF(file, chatId)
       setUpload(result)
     } catch (err) {
       setError(err.message || 'Upload failed')

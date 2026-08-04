@@ -10,3 +10,5 @@ faiss-cpu
 pandas
 langchain-text-splitters
 chromadb
+sqlalchemy
+psycopg[binary]

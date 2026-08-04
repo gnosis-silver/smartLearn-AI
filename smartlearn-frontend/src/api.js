@@ -17,6 +17,14 @@ export async function uploadPDF(file, chatId = CHAT_ID) {
   return readJSON(response)
 }
 
+export async function loadSession(chatId = CHAT_ID) {
+  const response = await fetch(
+    `${API}/sessions/${encodeURIComponent(chatId)}`,
+    { method: 'GET' },
+  )
+  return readJSON(response)
+}
+
 export async function askQuestion(message, chatId = CHAT_ID) {
   const response = await fetch(`${API}/chat`, {
     method: 'POST',

@@ -50,7 +50,7 @@ function renderContent(text) {
   return html
 }
 
-export default function ChatPanel({ enabled, onJumpToPage, uploadKey }) {
+export default function ChatPanel({ enabled, onJumpToPage, uploadKey, chatId, initialMessages }) {
   const [message, setMessage] = useState('')
   const [messages, setMessages] = useState([])
   const [status, setStatus] = useState('idle')
@@ -63,6 +63,13 @@ export default function ChatPanel({ enabled, onJumpToPage, uploadKey }) {
     setMessages([])
     setError('')
   }, [uploadKey])
+
+  /* ── load history when session is restored ── */
+  useEffect(() => {
+    if (initialMessages && initialMessages.length > 0) {
+      setMessages(initialMessages)
+    }
+  }, [initialMessages])
 
   /* ── auto-scroll to latest message ── */
   useEffect(() => {
@@ -81,7 +88,7 @@ export default function ChatPanel({ enabled, onJumpToPage, uploadKey }) {
       setMessages(prev => [...prev, userMsg])
       setMessage('')
 
-      const result = await askQuestion(trimmed)
+      const result = await askQuestion(trimmed, chatId)
 
       const assistantMsg = {
         role: 'assistant',

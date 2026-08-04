@@ -1416,3 +1416,192 @@ def relative_path_str(path: Union[str, Path], base: Union[str, Path]) -> str:
         return str(Path(path).relative_to(Path(base)))
     except ValueError:
         return str(path)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Appendix A — PostgreSQL + SQLAlchemy persistence helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _require_sqlalchemy() -> dict[str, Any]:
+    """Import SQLAlchemy modules or raise a clear ``ImportError``."""
+    try:
+        from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, create_engine  # noqa: F811
+        from sqlalchemy.orm import declarative_base, sessionmaker, Session  # noqa: F811
+        import datetime as _dt  # noqa: F401
+        return {
+            "Column": Column,
+            "Integer": Integer,
+            "String": String,
+            "Text": Text,
+            "DateTime": DateTime,
+            "ForeignKey": ForeignKey,
+            "create_engine": create_engine,
+            "declarative_base": declarative_base,
+            "sessionmaker": sessionmaker,
+            "Session": Session,
+            "datetime": _dt,
+        }
+    except ImportError:
+        raise ImportError(
+            "sqlalchemy is required for the DB history path. "
+            "Install it with: pip install sqlalchemy psycopg[binary]"
+        )
+
+
+def build_history_engine(db_url: str):
+    """Create a SQLAlchemy engine from a database URL.
+
+    ``postgresql+psycopg://postgres:postgres@127.0.0.1:5432/smartlearn_day3``
+    """
+    sa = _require_sqlalchemy()
+    return sa["create_engine"](db_url, echo=False)
+
+
+def build_history_session_factory(engine):
+    """Return a ``sessionmaker`` bound to *engine* for short-lived DB sessions."""
+    sa = _require_sqlalchemy()
+    return sa["sessionmaker"](bind=engine)
+
+
+def ensure_history_tables(engine) -> None:
+    """Create the ``conversations`` and ``messages`` tables if they don't exist."""
+    sa = _require_sqlalchemy()
+    Base = sa["declarative_base"]()
+
+    class Conversation(Base):
+        __tablename__ = "conversations"
+        id = sa["Column"](sa["Integer"], primary_key=True, autoincrement=True)
+        chat_id = sa["Column"](sa["String"], unique=True, nullable=False, index=True)
+        filename = sa["Column"](sa["String"], nullable=False, default="")
+        created_at = sa["Column"](sa["DateTime"], default=sa["datetime"].datetime.utcnow)
+
+    class Message(Base):
+        __tablename__ = "messages"
+        id = sa["Column"](sa["Integer"], primary_key=True, autoincrement=True)
+        conversation_id = sa["Column"](sa["Integer"], sa["ForeignKey"]("conversations.id"), nullable=False)
+        role = sa["Column"](sa["String"], nullable=False)
+        content = sa["Column"](sa["Text"], nullable=False, default="")
+        citations_json = sa["Column"](sa["Text"], nullable=False, default="[]")
+        created_at = sa["Column"](sa["DateTime"], default=sa["datetime"].datetime.utcnow)
+
+    Base.metadata.create_all(engine)
+    return Conversation, Message
+
+
+def get_or_create_conversation(session, chat_id: str, filename: str | None = None):
+    """Find or create a conversation row for *chat_id*."""
+    sa = _require_sqlalchemy()
+    Conversation, _ = ensure_history_tables(session.get_bind())
+
+    conv = session.query(Conversation).filter_by(chat_id=chat_id).first()
+    if conv is None:
+        conv = Conversation(chat_id=chat_id, filename=filename or "")
+        session.add(conv)
+        session.flush()
+    elif filename and not conv.filename:
+        conv.filename = filename
+        session.flush()
+    return conv
+
+
+def load_history_from_db(session, chat_id: str) -> list[dict]:
+    """Load previous turns for *chat_id* from PostgreSQL.
+
+    Returns a list of ``{question, answer, citations}`` dicts, matching
+    the in-memory history shape used elsewhere in ``rag.py``.
+    """
+    sa = _require_sqlalchemy()
+    _, Message = ensure_history_tables(session.get_bind())
+    conv = get_or_create_conversation(session, chat_id)
+
+    rows = (
+        session.query(Message)
+        .filter_by(conversation_id=conv.id)
+        .order_by(Message.id.asc())
+        .all()
+    )
+
+    history: list[dict] = []
+    import json as _json
+
+    user_question: str | None = None
+    for row in rows:
+        if row.role == "user":
+            user_question = row.content
+        elif row.role == "assistant" and user_question is not None:
+            citations = _json.loads(row.citations_json or "[]")
+            history.append({
+                "question": user_question,
+                "answer": row.content,
+                "citations": citations,
+            })
+            user_question = None
+
+    return history
+
+
+def store_history_turn(
+    session,
+    chat_id: str,
+    question: str,
+    result: dict,
+    filename: str | None = None,
+) -> list[dict]:
+    """Save one user + assistant turn to PostgreSQL and return updated history."""
+    sa = _require_sqlalchemy()
+    import json as _json
+
+    _, Message = ensure_history_tables(session.get_bind())
+    conv = get_or_create_conversation(session, chat_id, filename=filename)
+
+    # user message
+    session.add(Message(
+        conversation_id=conv.id,
+        role="user",
+        content=question,
+        citations_json="[]",
+    ))
+
+    # assistant message
+    session.add(Message(
+        conversation_id=conv.id,
+        role="assistant",
+        content=result["answer"],
+        citations_json=_json.dumps(result.get("citations", [])),
+    ))
+
+    session.commit()
+    return load_history_from_db(session, chat_id)
+
+
+def answer_chat_turn_with_history_store(
+    document: dict,
+    chat_id: str,
+    message: str,
+    session_factory,
+    top_k: int = 3,
+    candidate_pool: int = 60,
+    answer_model: str = "deepseek-chat",
+) -> dict:
+    """Full chat turn with DB-backed history.
+
+    1. Load older turns from PostgreSQL.
+    2. Merge them into the in-memory document history (so retrieval + LLM see them).
+    3. Run the standard retrieval → answer pipeline.
+    4. Save the new turn back to PostgreSQL.
+    """
+    with session_factory() as session:
+        db_history = load_history_from_db(session, chat_id)
+        document["history"] = db_history
+
+    result = answer_document_turn(
+        document, message,
+        top_k=top_k,
+        candidate_pool=candidate_pool,
+        answer_model=answer_model,
+    )
+
+    with session_factory() as session:
+        store_history_turn(session, chat_id, message, result, filename=document.get("filename"))
+
+    return result
